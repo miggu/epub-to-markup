@@ -15,10 +15,23 @@ const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const readline = require('node:readline');
 
-const [, , inputArg, outputArg] = process.argv;
+const args = process.argv.slice(2);
+const flags = new Set();
+const positional = [];
+for (const arg of args) {
+  if (arg.startsWith('--')) {
+    flags.add(arg);
+  } else {
+    positional.push(arg);
+  }
+}
+
+const inputArg = positional[0];
+const outputArg = positional[1] || null;
+const tidyTitles = flags.has('--tidy-titles') || flags.has('--tidy');
 
 function usage() {
-  console.log('Usage: node epub2markup.js path/to/book.epub [output-file]');
+  console.log('Usage: node epub2markup.js path/to/book.epub [output-file] [--tidy-titles]');
 }
 
 if (!inputArg) {
@@ -315,6 +328,97 @@ function extractTitle(opfText) {
   return stripTags(match[1]);
 }
 
+function extractFirstHeading(html) {
+  const match = html.match(/<h[1-6][^>]*>([\s\S]*?)<\/h[1-6]>/i);
+  if (!match) return null;
+  const heading = stripTags(match[1]);
+  return heading || null;
+}
+
+function isNumericTitle(title) {
+  return /^(\d+|chapter\s+\d+)$/i.test(title.trim());
+}
+
+function normalizeTitle(title) {
+  return title.replace(/^#+\s*/, '').trim();
+}
+
+function titleEquals(a, b) {
+  return a.trim().toLowerCase() === b.trim().toLowerCase();
+}
+
+function pickTitleFromMarkup(markup, fallbackTitle) {
+  const lines = markup.split(/\r?\n/);
+  for (const line of lines) {
+    const match = line.match(/^#{2,6}\s+(.+)/);
+    if (match) {
+      const cand = normalizeTitle(match[1]);
+      if (cand && !isNumericTitle(cand)) return cand;
+    }
+  }
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    if (/^[a-z]{2,4}\d{0,3}$/i.test(trimmed)) continue;
+    if (/^[A-Z0-9][A-Z0-9\s\-,'\.\&:;()]+$/.test(trimmed) && trimmed.length <= 120) {
+      return trimmed;
+    }
+  }
+  if (fallbackTitle && fallbackTitle.trim()) return fallbackTitle.trim();
+  const first = lines.find((line) => line.trim());
+  if (first && /^#\s+/.test(first)) return normalizeTitle(first);
+  return null;
+}
+
+function tidyChapterMarkup(markup, fallbackTitle) {
+  const lines = markup.split(/\r?\n/);
+  let idx = 0;
+  while (idx < lines.length && !lines[idx].trim()) idx += 1;
+
+  const title = pickTitleFromMarkup(markup, fallbackTitle) || fallbackTitle || 'Chapter';
+  const titleLower = title.toLowerCase();
+
+  if (idx < lines.length && /^#\s+/.test(lines[idx].trim())) {
+    lines[idx] = `# ${title}`;
+  } else {
+    lines.splice(idx, 0, `# ${title}`);
+  }
+
+  for (let i = idx + 1; i < Math.min(idx + 5, lines.length); i += 1) {
+    if (/^[a-z]{2,4}\d{0,3}$/i.test(lines[i].trim())) {
+      lines.splice(i, 1);
+      break;
+    }
+  }
+
+  for (let i = idx + 1; i < Math.min(idx + 5, lines.length); i += 1) {
+    if (titleEquals(lines[i].trim(), title)) {
+      lines.splice(i, 1);
+      break;
+    }
+    if (lines[i].trim()) break;
+  }
+
+  for (let i = idx + 1; i < lines.length; i += 1) {
+    if (!/^#{2,6}\s+/.test(lines[i])) continue;
+    const cand = normalizeTitle(lines[i]);
+    if (titleEquals(cand, title)) {
+      lines.splice(i, 1);
+      break;
+    }
+    if (isNumericTitle(cand)) {
+      const next = lines.slice(i + 1).find((l) => /^#{2,6}\s+/.test(l));
+      if (next && titleEquals(normalizeTitle(next), title)) {
+        lines.splice(i, 1);
+      }
+    }
+  }
+
+  while (lines.length > 0 && !lines[0].trim()) lines.shift();
+  const cleaned = lines.join('\n').replace(/\n{3,}/g, '\n\n').trimEnd();
+  return { title, markup: cleaned };
+}
+
 function promptSplit(totalChapters) {
   if (!process.stdin.isTTY) return { mode: 'single', includeImages: false };
 
@@ -466,8 +570,9 @@ function main() {
     for (const item of htmlItems) {
       if (!fs.existsSync(item.path)) continue;
       const html = readText(item.path, item.href);
+      const heading = extractFirstHeading(html);
       chapters.push({
-        label: path.basename(item.href),
+        label: heading || path.basename(item.href),
         content: html,
         order: spine.indexOf(item.idref),
         filePath: item.path,
@@ -550,12 +655,22 @@ function main() {
       if (markup) {
         if (outputMode === 'split') {
           const index = processed + 1;
-          const filenameBase = slugifyTitle(chapter.label, index);
+          let title = chapter.label || `Chapter ${index}`;
+          let content = markup;
+          if (tidyTitles) {
+            const tidied = tidyChapterMarkup(markup, title);
+            title = tidied.title || title;
+            content = tidied.markup;
+          }
+          const filenameBase = slugifyTitle(title, index);
           const filename = `${filenameBase}.md`;
           const target = path.join(chapterDir, filename);
-          const title = chapter.label || `Chapter ${index}`;
-          const withTitle = `# ${title}\n\n${markup}`;
-          fs.writeFileSync(target, withTitle + '\n', 'utf8');
+          if (tidyTitles) {
+            fs.writeFileSync(target, content + '\n', 'utf8');
+          } else {
+            const withTitle = `# ${title}\n\n${markup}`;
+            fs.writeFileSync(target, withTitle + '\n', 'utf8');
+          }
         } else {
           const title = chapter.label ? `# ${chapter.label}\n\n` : '';
           sections.push(`${title}${markup}`);
